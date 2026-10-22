@@ -1,0 +1,856 @@
+package com.renpytool
+
+import android.app.Application
+import android.content.Context
+import android.content.Intent
+import android.content.SharedPreferences
+import android.util.Log
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.chaquo.python.PyObject
+import com.chaquo.python.Python
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+
+/**
+ * ViewModel for MainActivity
+ * Handles all business logic and state management using coroutines and StateFlow
+ */
+class MainViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val context: Context = application.applicationContext
+    private val prefs: SharedPreferences = context.getSharedPreferences("RentoolPrefs", Context.MODE_PRIVATE)
+
+    // Python modules
+    private val python: Python = Python.getInstance()
+    private val rpaModule: PyObject = python.getModule("rpa_wrapper")
+    private val decompileModule: PyObject = python.getModule("decompile_wrapper")
+
+    // State flows for card statuses
+    private val _extractStatus = MutableStateFlow("No files extracted yet")
+    val extractStatus: StateFlow<String> = _extractStatus.asStateFlow()
+
+    private val _createStatus = MutableStateFlow("No archive created yet")
+    val createStatus: StateFlow<String> = _createStatus.asStateFlow()
+
+    private val _decompileStatus = MutableStateFlow("No files decompiled yet")
+    val decompileStatus: StateFlow<String> = _decompileStatus.asStateFlow()
+
+    private val _editStatus = MutableStateFlow("No files edited yet")
+    val editStatus: StateFlow<String> = _editStatus.asStateFlow()
+
+    private val _compressStatus = MutableStateFlow("No games compressed yet")
+    val compressStatus: StateFlow<String> = _compressStatus.asStateFlow()
+
+    // Cards enabled state
+    private val _cardsEnabled = MutableStateFlow(true)
+    val cardsEnabled: StateFlow<Boolean> = _cardsEnabled.asStateFlow()
+
+    // Theme mode state
+    enum class ThemeMode {
+        SYSTEM, LIGHT, DARK;
+
+        companion object {
+            fun fromString(value: String): ThemeMode {
+                return values().find { it.name == value } ?: SYSTEM
+            }
+        }
+    }
+
+    private val _themeMode = MutableStateFlow(
+        ThemeMode.fromString(prefs.getString("theme_mode", ThemeMode.SYSTEM.name) ?: ThemeMode.SYSTEM.name)
+    )
+    val themeMode: StateFlow<ThemeMode> = _themeMode.asStateFlow()
+
+    init {
+        // Load edit status from SharedPreferences
+        updateEditStatus()
+    }
+
+    /**
+     * Update edit status from SharedPreferences
+     */
+    fun updateEditStatus() {
+        val lastFilePath = prefs.getString("last_rpy_edit_file", null)
+        _editStatus.value = if (lastFilePath != null) {
+            val file = File(lastFilePath)
+            if (file.exists()) {
+                "Last edited: ${file.name}"
+            } else {
+                "No files edited yet"
+            }
+        } else {
+            "No files edited yet"
+        }
+    }
+
+    /**
+     * Start foreground service for background operation support
+     */
+    private fun startOperationService(action: String, sourcePath: String? = null, outputPath: String? = null) {
+        try {
+            val intent = Intent(context, OperationService::class.java).apply {
+                this.action = action
+                sourcePath?.let { putExtra(OperationService.EXTRA_SOURCE_PATH, it) }
+                outputPath?.let { putExtra(OperationService.EXTRA_OUTPUT_PATH, it) }
+            }
+            ContextCompat.startForegroundService(context, intent)
+            Log.i("MainViewModel", "Started foreground service for $action")
+        } catch (e: Exception) {
+            Log.e("MainViewModel", "Failed to start foreground service", e)
+        }
+    }
+
+    /**
+     * Perform batch extraction of RPA files
+     */
+    fun performBatchExtraction(rpaFilePaths: ArrayList<String>, extractDirPath: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                val tracker = ProgressTracker(context)
+                tracker.clearProgress()
+
+                // Write initial progress BEFORE starting service
+                val initialData = ProgressData().apply {
+                    operation = "extract"
+                    status = "in_progress"
+                    startTime = System.currentTimeMillis()
+                    lastUpdateTime = System.currentTimeMillis()
+                    totalFiles = 0
+                    processedFiles = 0
+                    currentFile = "Starting batch extraction..."
+                    currentBatchIndex = 1
+                }
+                tracker.writeProgress(initialData)
+
+                // NOW start foreground service
+                withContext(Dispatchers.Main) {
+                    startOperationService(OperationService.ACTION_START_EXTRACTION, extractDirPath, extractDirPath)
+                }
+
+                val totalFiles = rpaFilePaths.size
+                var currentIndex = 1
+                val batchStartTime = System.currentTimeMillis()
+
+                for (rpaFilePath in rpaFilePaths) {
+                    try {
+                        val fileName = File(rpaFilePath).name
+
+                        // Call Python extraction with batch info
+                        val result = rpaModule.callAttr(
+                            "extract_rpa",
+                            rpaFilePath,
+                            extractDirPath,
+                            tracker.progressFilePath,
+                            currentIndex,
+                            totalFiles,
+                            fileName
+                        )
+
+                        if (result == null) {
+                            throw Exception("Python function returned null")
+                        }
+
+                        val successObj = result.callAttr("__getitem__", "success")
+                        val success = successObj.toJava(Boolean::class.java)
+
+                        if (!success) {
+                            val messageObj = result.callAttr("__getitem__", "message")
+                            val message = messageObj.toJava(String::class.java)
+                            throw Exception(message)
+                        }
+
+                        currentIndex++
+
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+
+                        // Update progress with error
+                        try {
+                            val errorData = ProgressData().apply {
+                                operation = "extract"
+                                status = "failed"
+                                errorMessage = "Error on file $currentIndex/$totalFiles: ${e.message}"
+                                currentBatchIndex = currentIndex
+                                totalBatchCount = totalFiles
+                            }
+                            tracker.writeProgress(errorData)
+                        } catch (ex: Exception) {
+                            ex.printStackTrace()
+                        }
+                        return@withContext
+                    }
+                }
+
+                // Mark as completed
+                try {
+                    val completeData = ProgressData().apply {
+                        operation = "extract"
+                        status = "completed"
+                        currentBatchIndex = totalFiles
+                        totalBatchCount = totalFiles
+                        this.totalFiles = totalFiles
+                        processedFiles = totalFiles
+                        currentFile = "Complete"
+                        startTime = batchStartTime
+                        lastUpdateTime = System.currentTimeMillis()
+                    }
+                    tracker.writeProgress(completeData)
+
+                    _extractStatus.value = "Extracted $totalFiles archives"
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+    }
+
+    /**
+     * Perform single file extraction
+     */
+    fun performExtraction(rpaFilePath: String, extractDirPath: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                val tracker = ProgressTracker(context)
+                tracker.clearProgress()
+
+                try {
+                    // Initialize progress BEFORE starting service
+                    val initialData = ProgressData().apply {
+                        operation = "extract"
+                        status = "in_progress"
+                        startTime = System.currentTimeMillis()
+                        lastUpdateTime = System.currentTimeMillis()
+                        totalFiles = 0
+                        processedFiles = 0
+                        currentFile = "Starting extraction..."
+                    }
+                    tracker.writeProgress(initialData)
+
+                    // NOW start foreground service (it will immediately see the progress)
+                    withContext(Dispatchers.Main) {
+                        startOperationService(OperationService.ACTION_START_EXTRACTION, rpaFilePath, extractDirPath)
+                    }
+
+                    // Call Python extraction
+                    val result = rpaModule.callAttr(
+                        "extract_rpa",
+                        rpaFilePath,
+                        extractDirPath,
+                        tracker.progressFilePath
+                    )
+
+                    if (result == null) {
+                        throw Exception("Python function returned null")
+                    }
+
+                    val successObj = result.callAttr("__getitem__", "success")
+                    val filesObj = result.callAttr("__getitem__", "files")
+
+                    val success = successObj.toJava(Boolean::class.java)
+                    val fileCount = filesObj.asList().size
+
+                    _extractStatus.value = if (success) {
+                        "Extracted $fileCount files"
+                    } else {
+                        "Extraction failed"
+                    }
+
+                } catch (e: Exception) {
+                    e.printStackTrace()
+
+                    // Update progress with error
+                    try {
+                        val errorData = ProgressData().apply {
+                            operation = "extract"
+                            status = "failed"
+                            errorMessage = "Error: ${e.message}"
+                        }
+                        tracker.writeProgress(errorData)
+                    } catch (ex: Exception) {
+                        ex.printStackTrace()
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Perform batch creation from multiple sources
+     */
+    fun performBatchCreation(sourcePaths: ArrayList<String>, outputFilePath: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                val tracker = ProgressTracker(context)
+                tracker.clearProgress()
+
+                var tempDir: File? = null
+                try {
+                    val batchStartTime = System.currentTimeMillis()
+
+                    // Create temporary directory
+                    tempDir = File(context.cacheDir, "rpa_batch_temp_$batchStartTime")
+                    if (!tempDir.mkdir()) {
+                        throw Exception("Failed to create temporary directory")
+                    }
+
+                    val totalItems = sourcePaths.size
+
+                    // Copy all items to temp directory
+                    for (i in sourcePaths.indices) {
+                        val sourcePath = sourcePaths[i]
+                        val sourceFile = File(sourcePath)
+                        val itemName = sourceFile.name
+
+                        // Update progress
+                        val copyProgress = ProgressData().apply {
+                            operation = "create"
+                            currentBatchIndex = i + 1
+                            totalBatchCount = totalItems
+                            currentBatchFileName = itemName
+                            status = "in_progress"
+                            startTime = batchStartTime
+                            lastUpdateTime = System.currentTimeMillis()
+                            totalFiles = 0
+                            processedFiles = 0
+                            currentFile = "Copying to temp: $itemName"
+                        }
+                        tracker.writeProgress(copyProgress)
+
+                        // Copy to temp
+                        val destFile = File(tempDir, itemName)
+                        if (sourceFile.isDirectory) {
+                            copyDirectory(sourceFile, destFile)
+                        } else {
+                            copyFile(sourceFile, destFile)
+                        }
+                    }
+
+                    // Update progress for RPA creation
+                    val createProgress = ProgressData().apply {
+                        operation = "create"
+                        currentBatchIndex = totalItems
+                        totalBatchCount = totalItems
+                        currentBatchFileName = "Creating final archive..."
+                        status = "in_progress"
+                        startTime = batchStartTime
+                        lastUpdateTime = System.currentTimeMillis()
+                        totalFiles = 0
+                        processedFiles = 0
+                        currentFile = "Building RPA from $totalItems items"
+                    }
+                    tracker.writeProgress(createProgress)
+
+                    // Call Python creation
+                    val result = rpaModule.callAttr(
+                        "create_rpa",
+                        tempDir.absolutePath,
+                        outputFilePath,
+                        3,
+                        0xDEADBEEF.toInt(),
+                        tracker.progressFilePath
+                    )
+
+                    if (result == null) {
+                        throw Exception("Python function returned null")
+                    }
+
+                    val successObj = result.callAttr("__getitem__", "success")
+                    val filesObj = result.callAttr("__getitem__", "files")
+
+                    val success = successObj.toJava(Boolean::class.java)
+                    val fileCount = filesObj.asList().size
+
+                    _createStatus.value = if (success) {
+                        "Created archive with $fileCount files from $totalItems sources"
+                    } else {
+                        "Creation failed"
+                    }
+
+                } catch (e: Exception) {
+                    e.printStackTrace()
+
+                    // Update progress with error
+                    try {
+                        val errorData = ProgressData().apply {
+                            operation = "create"
+                            status = "failed"
+                            errorMessage = "Error: ${e.message}"
+                        }
+                        tracker.writeProgress(errorData)
+                    } catch (ex: Exception) {
+                        ex.printStackTrace()
+                    }
+                } finally {
+                    // Clean up temp directory
+                    tempDir?.let { if (it.exists()) deleteRecursive(it) }
+                }
+            }
+        }
+    }
+
+    /**
+     * Perform single archive creation
+     */
+    fun performCreation(sourceDirPath: String, outputFilePath: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                val tracker = ProgressTracker(context)
+                tracker.clearProgress()
+
+                try {
+                    // Initialize progress BEFORE starting service
+                    val initialData = ProgressData().apply {
+                        operation = "create"
+                        status = "in_progress"
+                        startTime = System.currentTimeMillis()
+                        lastUpdateTime = System.currentTimeMillis()
+                        totalFiles = 0
+                        processedFiles = 0
+                        currentFile = "Starting creation..."
+                    }
+                    tracker.writeProgress(initialData)
+
+                    // NOW start foreground service
+                    withContext(Dispatchers.Main) {
+                        startOperationService(OperationService.ACTION_START_CREATION, sourceDirPath, outputFilePath)
+                    }
+
+                    // Call Python creation
+                    val result = rpaModule.callAttr(
+                        "create_rpa",
+                        sourceDirPath,
+                        outputFilePath,
+                        3,
+                        0xDEADBEEF.toInt(),
+                        tracker.progressFilePath
+                    )
+
+                    if (result == null) {
+                        throw Exception("Python function returned null")
+                    }
+
+                    val successObj = result.callAttr("__getitem__", "success")
+                    val filesObj = result.callAttr("__getitem__", "files")
+
+                    val success = successObj.toJava(Boolean::class.java)
+                    val fileCount = filesObj.asList().size
+
+                    _createStatus.value = if (success) {
+                        "Created archive with $fileCount files"
+                    } else {
+                        "Creation failed"
+                    }
+
+                } catch (e: Exception) {
+                    e.printStackTrace()
+
+                    // Update progress with error
+                    try {
+                        val errorData = ProgressData().apply {
+                            operation = "create"
+                            status = "failed"
+                            errorMessage = "Error: ${e.message}"
+                        }
+                        tracker.writeProgress(errorData)
+                    } catch (ex: Exception) {
+                        ex.printStackTrace()
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Perform decompilation of RPYC files
+     */
+    fun performDecompile(sourceDirPath: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                val tracker = ProgressTracker(context)
+                tracker.clearProgress()
+
+                try {
+                    // Initialize progress BEFORE starting service
+                    val initialData = ProgressData().apply {
+                        operation = "decompile"
+                        status = "in_progress"
+                        startTime = System.currentTimeMillis()
+                        lastUpdateTime = System.currentTimeMillis()
+                        totalFiles = 0
+                        processedFiles = 0
+                        currentFile = "Starting decompilation..."
+                    }
+                    tracker.writeProgress(initialData)
+
+                    // NOW start foreground service
+                    withContext(Dispatchers.Main) {
+                        startOperationService(OperationService.ACTION_START_DECOMPILATION, sourceDirPath)
+                    }
+
+                    // Call Python decompilation
+                    val result = decompileModule.callAttr(
+                        "decompile_directory",
+                        sourceDirPath,
+                        tracker.progressFilePath
+                    )
+
+                    if (result == null) {
+                        throw Exception("Python function returned null")
+                    }
+
+                    val successObj = result.callAttr("__getitem__", "success")
+                    val messageObj = result.callAttr("__getitem__", "message")
+                    val statsObj = result.callAttr("__getitem__", "stats")
+
+                    val success = successObj.toJava(Boolean::class.java)
+                    val message = messageObj.toJava(String::class.java)
+
+                    // Extract stats
+                    val totalObj = statsObj.callAttr("__getitem__", "total")
+                    val successCountObj = statsObj.callAttr("__getitem__", "success")
+                    val skippedObj = statsObj.callAttr("__getitem__", "skipped")
+                    val failedObj = statsObj.callAttr("__getitem__", "failed")
+
+                    val total = totalObj.toJava(Int::class.java)
+                    val successCount = successCountObj.toJava(Int::class.java)
+                    val skipped = skippedObj.toJava(Int::class.java)
+                    val failed = failedObj.toJava(Int::class.java)
+
+                    _decompileStatus.value = if (success) {
+                        "Decompiled $total files ($successCount success, $skipped skipped, $failed failed)"
+                    } else {
+                        "Decompilation failed: $message"
+                    }
+
+                } catch (e: Exception) {
+                    e.printStackTrace()
+
+                    // Update progress with error
+                    try {
+                        val errorData = ProgressData().apply {
+                            operation = "decompile"
+                            status = "failed"
+                            errorMessage = "Error: ${e.message}"
+                        }
+                        tracker.writeProgress(errorData)
+                    } catch (ex: Exception) {
+                        ex.printStackTrace()
+                    }
+
+                    _decompileStatus.value = "Decompilation error: ${e.message}"
+                }
+            }
+        }
+    }
+
+    /**
+     * Set cards enabled state
+     */
+    fun setCardsEnabled(enabled: Boolean) {
+        _cardsEnabled.value = enabled
+    }
+
+    // Helper methods for file operations
+    private fun copyFile(source: File, dest: File) {
+        FileInputStream(source).use { fis ->
+            FileOutputStream(dest).use { fos ->
+                val buffer = ByteArray(8192)
+                var length: Int
+                while (fis.read(buffer).also { length = it } > 0) {
+                    fos.write(buffer, 0, length)
+                }
+            }
+        }
+    }
+
+    private fun copyDirectory(source: File, dest: File) {
+        if (!dest.mkdir()) {
+            throw Exception("Failed to create directory: ${dest.absolutePath}")
+        }
+
+        source.listFiles()?.forEach { file ->
+            val destFile = File(dest, file.name)
+            if (file.isDirectory) {
+                copyDirectory(file, destFile)
+            } else {
+                copyFile(file, destFile)
+            }
+        }
+    }
+
+    private fun deleteRecursive(file: File) {
+        if (file.isDirectory) {
+            file.listFiles()?.forEach { child ->
+                deleteRecursive(child)
+            }
+        }
+        file.delete()
+    }
+
+    /**
+     * Perform game compression
+     */
+    fun performCompression(
+        sourceDirPath: String,
+        outputDirPath: String,
+        settings: CompressionSettings,
+        signingOption: com.renpytool.keystore.SigningOption? = null
+    ) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                val sourceFile = File(sourceDirPath)
+
+                // Detect if source is an APK file or directory
+                if (sourceFile.isFile && sourceFile.name.lowercase().endsWith(".apk")) {
+                    // APK compression path
+                    performApkCompression(sourceFile, File(outputDirPath), settings, signingOption)
+                } else {
+                    // Directory compression path (existing logic)
+                    performDirectoryCompression(sourceDirPath, outputDirPath, settings)
+                }
+            }
+        }
+    }
+
+    /**
+     * Perform APK compression
+     */
+    private suspend fun performApkCompression(
+        apkFile: File,
+        outputApk: File,
+        settings: CompressionSettings,
+        signingOption: com.renpytool.keystore.SigningOption?
+    ) {
+        val tracker = ProgressTracker(context)
+        tracker.clearProgress()
+
+        try {
+            // Validate it's a Ren'Py APK
+            val apkCompressor = ApkCompressor(context)
+            if (!apkCompressor.detectRenpyApk(apkFile)) {
+                withContext(Dispatchers.Main) {
+                    _compressStatus.value = "Error: Not a Ren'Py APK (no x- prefixed assets found)"
+                }
+                return
+            }
+
+            // Initialize progress BEFORE starting service
+            val initialData = ProgressData().apply {
+                operation = "compress_apk"
+                status = "in_progress"
+                startTime = System.currentTimeMillis()
+                lastUpdateTime = System.currentTimeMillis()
+                totalFiles = 0
+                processedFiles = 0
+                currentFile = "Preparing APK compression..."
+            }
+            tracker.writeProgress(initialData)
+
+            // Start foreground service
+            withContext(Dispatchers.Main) {
+                startOperationService(OperationService.ACTION_START_COMPRESSION, apkFile.absolutePath, outputApk.absolutePath)
+            }
+
+            // Perform APK compression
+            val result = apkCompressor.compressApk(apkFile, outputApk, settings, tracker, signingOption)
+
+            if (result.success) {
+                val ratio = String.format("%.1f", result.reductionPercent)
+                val statusMsg = buildString {
+                    append("Compressed APK: ${result.filesProcessed} files ($ratio% reduction)")
+                    if (result.filesFailed > 0) {
+                        append(", ${result.filesFailed} failed")
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    _compressStatus.value = statusMsg
+                }
+            } else {
+                withContext(Dispatchers.Main) {
+                    _compressStatus.value = "APK compression failed"
+                }
+            }
+
+        } catch (e: Exception) {
+            Log.e("MainViewModel", "APK compression error", e)
+            withContext(Dispatchers.Main) {
+                _compressStatus.value = "APK compression error: ${e.message}"
+            }
+        }
+    }
+
+    /**
+     * Perform directory compression (existing logic)
+     */
+    private suspend fun performDirectoryCompression(
+        sourceDirPath: String,
+        outputDirPath: String,
+        settings: CompressionSettings
+    ) {
+        val tracker = ProgressTracker(context)
+        tracker.clearProgress()
+
+        try {
+            // Initialize progress BEFORE starting service
+            val initialData = ProgressData().apply {
+                operation = "compress"
+                status = "in_progress"
+                startTime = System.currentTimeMillis()
+                lastUpdateTime = System.currentTimeMillis()
+                totalFiles = 0
+                processedFiles = 0
+                currentFile = "Scanning files..."
+            }
+            tracker.writeProgress(initialData)
+
+            // NOW start foreground service (it will immediately see the progress)
+            withContext(Dispatchers.Main) {
+                startOperationService(OperationService.ACTION_START_COMPRESSION, sourceDirPath, outputDirPath)
+            }
+
+            // Create compression manager and perform compression
+            val compressionManager = CompressionManager(context)
+            val result = compressionManager.compressGame(
+                File(sourceDirPath),
+                File(outputDirPath),
+                settings,
+                tracker
+            )
+
+            if (result.success) {
+                val ratio = String.format("%.1f", result.reductionPercent)
+
+                // Handle "nothing to do" case
+                if (result.filesProcessed == 0 && result.filesFailed == 0) {
+                    _compressStatus.value = "No compressible files found"
+                } else {
+                    val statusMsg = buildString {
+                        append("Compressed ${result.filesProcessed} files ($ratio% reduction)")
+                        if (result.filesFailed > 0) {
+                            append(", ${result.filesFailed} failed")
+                        }
+                    }
+                    _compressStatus.value = statusMsg
+                }
+
+                // If createRpaAfter is enabled and we have files, create RPA archive from compressed output
+                if (settings.createRpaAfter && result.filesProcessed > 0) {
+                    try {
+                        Log.i("MainViewModel", "Creating RPA archive from compressed output...")
+
+                        // Update progress for RPA creation phase
+                        val rpaProgress = ProgressData().apply {
+                            operation = "create"
+                            status = "in_progress"
+                            startTime = System.currentTimeMillis()
+                            lastUpdateTime = System.currentTimeMillis()
+                            totalFiles = 0
+                            processedFiles = 0
+                            currentFile = "Creating RPA archive..."
+                        }
+                        tracker.writeProgress(rpaProgress)
+
+                        // Generate output RPA file path
+                        val outputDir = File(outputDirPath)
+                        val rpaFileName = "${outputDir.name}.rpa"
+                        val rpaOutputPath = File(outputDir.parentFile, rpaFileName).absolutePath
+
+                        // Call Python creation
+                        val rpaResult = rpaModule.callAttr(
+                            "create_rpa",
+                            outputDirPath,
+                            rpaOutputPath,
+                            3,
+                            0xDEADBEEF.toInt(),
+                            tracker.progressFilePath
+                        )
+
+                        if (rpaResult != null) {
+                            val successObj = rpaResult.callAttr("__getitem__", "success")
+                            val filesObj = rpaResult.callAttr("__getitem__", "files")
+
+                            val rpaSuccess = successObj.toJava(Boolean::class.java)
+                            val fileCount = filesObj.asList().size
+
+                            if (rpaSuccess) {
+                                val rpaStatusMsg = buildString {
+                                    append("Compressed ${result.filesProcessed} files ($ratio% reduction)")
+                                    if (result.filesFailed > 0) {
+                                        append(", ${result.filesFailed} failed")
+                                    }
+                                    append(" + created RPA with $fileCount files")
+                                }
+                                _compressStatus.value = rpaStatusMsg
+                                Log.i("MainViewModel", "RPA archive created successfully: $rpaOutputPath")
+                            } else {
+                                _compressStatus.value = buildString {
+                                    append("Compressed ${result.filesProcessed} files ($ratio% reduction)")
+                                    if (result.filesFailed > 0) {
+                                        append(", ${result.filesFailed} failed")
+                                    }
+                                    append(" but RPA creation failed")
+                                }
+                                Log.w("MainViewModel", "RPA creation failed")
+                            }
+                        } else {
+                            _compressStatus.value = buildString {
+                                append("Compressed ${result.filesProcessed} files ($ratio% reduction)")
+                                if (result.filesFailed > 0) {
+                                    append(", ${result.filesFailed} failed")
+                                }
+                                append(" but RPA creation returned null")
+                            }
+                        }
+
+                    } catch (e: Exception) {
+                        Log.e("MainViewModel", "Error creating RPA after compression", e)
+                        _compressStatus.value = buildString {
+                            append("Compressed ${result.filesProcessed} files ($ratio% reduction)")
+                            if (result.filesFailed > 0) {
+                                append(", ${result.filesFailed} failed")
+                            }
+                            append(" but RPA creation error: ${e.message}")
+                        }
+                    }
+                }
+            } else {
+                _compressStatus.value = "Compression failed: ${result.error ?: "Unknown error"}"
+            }
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+
+            // Update progress with error
+            try {
+                val errorData = ProgressData().apply {
+                    operation = "compress"
+                    status = "failed"
+                    errorMessage = "Error: ${e.message}"
+                }
+                tracker.writeProgress(errorData)
+            } catch (ex: Exception) {
+                ex.printStackTrace()
+            }
+
+            _compressStatus.value = "Compression error: ${e.message}"
+        }
+    }
+
+    /**
+     * Set the theme mode and save to preferences
+     */
+    fun setThemeMode(mode: ThemeMode) {
+        _themeMode.value = mode
+        prefs.edit().putString("theme_mode", mode.name).apply()
+    }
+}

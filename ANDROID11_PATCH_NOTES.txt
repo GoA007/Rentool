@@ -1,0 +1,13 @@
+Rentool Android 11 compatibility patch
+
+Changes made:
+- minSdk lowered from 33 (Android 13) to 30 (Android 11).
+- versionCode incremented to 13.
+- versionName set to 1.7.4-android11.
+
+Important limitations:
+- This is patched SOURCE CODE, not a compiled or tested APK.
+- Lowering minSdk only removes the declared minimum-OS installation barrier. It does not prove every feature/dependency works on Android 11.
+- Build with Android Studio / Android Gradle Plugin 8.7.3, Gradle 8.13, JDK 17, and Android SDK Platform 34.
+- If installing a build signed with a different key over an existing Rentool installation, Android may reject it; uninstall the old app first (this may delete its private app data).
+- Device needs a supported ABI. Project currently filters native Python libraries to arm64-v8a and x86_64; most modern Android phones use arm64-v8a.

@@ -1,0 +1,127 @@
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
+    id 'com.chaquo.python'
+}
+
+// Load keystore properties
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+def keystoreProperties = new Properties()
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
+android {
+    namespace = 'com.renpytool'
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId "com.renpytool"
+        minSdk 30
+        targetSdk 34
+        versionCode 13
+        versionName "1.7.4-android11"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters "arm64-v8a", "x86_64"
+        }
+
+        python {
+            // Use Python 3.8 for best Chaquopy compatibility
+            version "3.8"
+
+            // No longer need Pillow - using native Android Bitmap APIs for image compression
+        }
+    }
+
+    signingConfigs {
+        release {
+            if (keystorePropertiesFile.exists()) {
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (keystorePropertiesFile.exists()) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    buildFeatures {
+        compose = true
+    }
+}
+
+dependencies {
+    // AndroidX Core
+    implementation libs.appcompat
+    implementation libs.material
+    implementation 'androidx.coordinatorlayout:coordinatorlayout:1.2.0'
+    implementation 'androidx.documentfile:documentfile:1.0.1'
+
+    // Compose BOM (manages Compose versions)
+    implementation platform(libs.compose.bom)
+    implementation libs.compose.ui
+    implementation libs.compose.ui.tooling.preview
+    implementation libs.compose.material3
+    implementation libs.compose.material.icons.extended
+    debugImplementation libs.compose.ui.tooling
+    debugImplementation libs.compose.ui.test.manifest
+
+    // Compose Integration
+    implementation libs.activity.compose
+    implementation libs.lifecycle.viewmodel.compose
+    implementation libs.lifecycle.runtime.compose
+    implementation libs.navigation.compose
+
+    // Lifecycle & ViewModel
+    implementation libs.lifecycle.viewmodel.ktx
+    implementation libs.lifecycle.runtime.ktx
+
+    // Coroutines
+    implementation libs.kotlinx.coroutines.android
+    implementation libs.kotlinx.coroutines.core
+
+    // JSON parsing for update checker
+    implementation 'com.google.code.gson:gson:2.10.1'
+
+    // Sora Editor - Code editor for .rpy files
+    implementation platform('io.github.rosemoe:editor-bom:0.23.7')
+    implementation 'io.github.rosemoe:editor'
+    implementation 'io.github.rosemoe:language-textmate'
+
+    // FFmpeg-Kit for audio/video compression (local AAR)
+    implementation files('libs/ffmpeg-kit-full-6.0-2.LTS.aar')
+    // FFmpeg-Kit dependencies
+    implementation 'com.arthenica:smart-exception-java:0.2.1'
+
+    // APK signing for APK compression feature
+    implementation 'com.android.tools.build:apksig:8.2.0'
+
+    // BouncyCastle for generating self-signed certificates
+    implementation 'org.bouncycastle:bcpkix-jdk15on:1.70'
+
+    // Testing
+    testImplementation libs.junit
+    androidTestImplementation libs.ext.junit
+    androidTestImplementation libs.espresso.core
+}
