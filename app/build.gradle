@@ -109,8 +109,8 @@ dependencies {
     implementation 'io.github.rosemoe:editor'
     implementation 'io.github.rosemoe:language-textmate'
 
-    // FFmpeg-Kit for audio/video compression (local AAR)
-    implementation files('libs/ffmpeg-kit-full-6.0-2.LTS.aar')
+    // FFmpeg-Kit for audio/video compression (published Maven Central dependency)
+    implementation 'dev.ffmpegkit-maintained:ffmpeg-kit-full:6.0.3'
     // FFmpeg-Kit dependencies
     implementation 'com.arthenica:smart-exception-java:0.2.1'
 
