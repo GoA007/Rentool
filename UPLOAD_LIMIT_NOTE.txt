@@ -1,0 +1,8 @@
+Rentool Android 11 source package (upload-friendly)
+
+This ZIP intentionally omits app/libs/ffmpeg-kit-full-6.0-2.LTS.aar because that upstream binary is about 65.5 MB and exceeds the web upload limit.
+
+Before building the APK, restore the original file at:
+  app/libs/ffmpeg-kit-full-6.0-2.LTS.aar
+
+Without that AAR, Gradle will not be able to compile the existing FFmpegKit integration. The source is patched to minSdk 30 / versionCode 13 / versionName 1.7.4-android11, but this ZIP alone is not a complete buildable project. Preserve the original upstream LICENSE and attribution.

@@ -1,0 +1,46 @@
+*.iml
+.gradle
+/local.properties
+/.idea/
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Release build outputs
+/app/release/
+/app/debug/
+
+# Claude Code workspace settings
+.claude/
+
+# Python cache files
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+
+# Editor temporary files
+*.swp
+*.swo
+*~
+
+
+# *.apk
+# *.aab
+
+# Signing keystore and credentials
+*.keystore
+*.jks
+keystore.properties
+git token.txt
+*.kate-swp
+.*.swp
+
+# Build logs and spec files
+build_output.txt
+build_with_pillow.log
+pillow_build.log
+renpy compressor spec sheet.txt
